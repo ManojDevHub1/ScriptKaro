@@ -113,9 +113,59 @@ export function normalizeResult(raw: any, fallbackTopic: string, provider: AIPro
   };
 }
 
+function isRateLimitError(err: any): boolean {
+  if (!err) return false;
+  const status = err?.status || err?.statusCode || (err?.response && err.response.status);
+  if (status === 429) return true;
+  const msg = String(err?.message || '').toLowerCase();
+  return (
+    msg.includes('429') ||
+    msg.includes('resource_exhausted') ||
+    msg.includes('resource has been exhausted') ||
+    msg.includes('quota') ||
+    msg.includes('rate limit')
+  );
+}
+
+function isNotFoundError(err: any): boolean {
+  if (!err) return false;
+  const status = err?.status || err?.statusCode || (err?.response && err.response.status);
+  if (status === 404) return true;
+  const msg = String(err?.message || '').toLowerCase();
+  return (
+    msg.includes('404') ||
+    msg.includes('not found') ||
+    msg.includes('not_found') ||
+    msg.includes('does not exist') ||
+    msg.includes('no longer available') ||
+    msg.includes('unavailable for free') ||
+    msg.includes('model_not_found')
+  );
+}
+
 /**
  * 1. Google Gemini Provider
+ * GEMINI_MODEL: default "gemini-2.5-flash", second attempt on "gemini-2.5-flash-lite" on 429
  */
+async function callGeminiSingle(
+  ai: GoogleGenAI,
+  model: string,
+  systemInstruction: string,
+  prompt: string
+): Promise<string> {
+  const response = await ai.models.generateContent({
+    model,
+    contents: prompt,
+    config: {
+      systemInstruction,
+      responseMimeType: 'application/json',
+      temperature: 0.75,
+      httpOptions: { timeout: 20000 },
+    },
+  });
+  return response.text || '';
+}
+
 async function callGemini(
   req: GenerateRequest,
   apiKey: string,
@@ -129,45 +179,31 @@ async function callGemini(
     prompt += '\n\nCRITICAL: Return ONLY valid JSON adhering strictly to the schema. No markdown fences, no conversational text.';
   }
 
-  const candidateModels = [
-    'gemini-3-flash-preview',
-    'gemini-3.8-flash',
-    'gemini-2.5-flash',
-    'gemini-flash-latest',
-  ];
+  const primaryModel = process.env.GEMINI_MODEL?.trim() || 'gemini-2.5-flash';
+  const fallbackLiteModel = 'gemini-2.5-flash-lite';
 
   let rawText = '';
-  let lastErr: any = null;
+  let activeModel = primaryModel;
 
-  for (const model of candidateModels) {
-    try {
-      const response = await ai.models.generateContent({
-        model,
-        contents: prompt,
-        config: {
-          systemInstruction,
-          responseMimeType: 'application/json',
-          temperature: 0.75,
-          httpOptions: { timeout: 20000 },
-        },
-      });
-
-      if (response.text) {
-        rawText = response.text;
-        break;
+  try {
+    rawText = await callGeminiSingle(ai, primaryModel, systemInstruction, prompt);
+  } catch (err: any) {
+    // If 429 / quota error on primary model, attempt with gemini-2.5-flash-lite
+    if (isRateLimitError(err)) {
+      console.warn(`[Gemini] Primary model "${primaryModel}" hit 429 rate limit. Retrying with "${fallbackLiteModel}"...`);
+      try {
+        activeModel = fallbackLiteModel;
+        rawText = await callGeminiSingle(ai, fallbackLiteModel, systemInstruction, prompt);
+      } catch (fallbackErr: any) {
+        throw fallbackErr;
       }
-    } catch (err: any) {
-      lastErr = err;
-      const msg = String(err?.message || '');
-      if (msg.includes('404') || msg.includes('no longer available') || msg.includes('NOT_FOUND')) {
-        continue;
-      }
+    } else {
       throw err;
     }
   }
 
   if (!rawText) {
-    throw lastErr || new Error('Gemini returned an empty response.');
+    throw new Error(`Gemini model ${activeModel} returned an empty response.`);
   }
 
   const cleaned = sanitizeJsonText(rawText);
@@ -189,13 +225,74 @@ async function callGemini(
 }
 
 /**
- * 2. Groq Provider (model: llama-3.3-70b-versatile)
+ * 2. Groq Provider
+ * Dynamic model discovery with preference list and caching
  */
+let cachedGroqModel: string | null = null;
+
+const GROQ_PREFERENCE_LIST = [
+  'llama-3.3-70b-versatile',
+  'meta-llama/llama-4-maverick-17b-128e-instruct',
+  'meta-llama/llama-4-scout-17b-16e-instruct',
+  'llama-3.1-8b-instant',
+];
+
+async function resolveGroqModel(apiKey: string): Promise<string> {
+  if (cachedGroqModel) {
+    return cachedGroqModel;
+  }
+
+  const envModel = process.env.GROQ_MODEL?.trim();
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+
+    const res = await fetch('https://api.groq.com/openai/v1/models', {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (res.ok) {
+      const data = await res.json();
+      const availableModels = new Set<string>(
+        Array.isArray(data?.data) ? data.data.map((m: any) => String(m?.id || '')) : []
+      );
+
+      // 1. Pick GROQ_MODEL if defined and available
+      if (envModel && availableModels.has(envModel)) {
+        cachedGroqModel = envModel;
+        return cachedGroqModel;
+      }
+
+      // 2. Pick first available from preference list
+      for (const pref of GROQ_PREFERENCE_LIST) {
+        if (availableModels.has(pref)) {
+          cachedGroqModel = pref;
+          return cachedGroqModel;
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[Groq] Failed to discover models list, using preference default:', err);
+  }
+
+  cachedGroqModel = envModel || GROQ_PREFERENCE_LIST[0];
+  return cachedGroqModel;
+}
+
 async function callGroq(
   req: GenerateRequest,
   apiKey: string,
   isRetry = false
 ): Promise<GenerateResponse> {
+  const model = await resolveGroqModel(apiKey);
   const systemInstruction = buildSystemInstruction() + '\nYou MUST return a JSON object with keys: hooks, script, caption, hashtags, coverText.';
   let prompt = buildUserPrompt(req);
 
@@ -210,11 +307,11 @@ async function callGroq(
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model,
         messages: [
           { role: 'system', content: systemInstruction },
           { role: 'user', content: prompt },
@@ -229,7 +326,13 @@ async function callGroq(
 
     if (!res.ok) {
       const errBody = await res.text();
-      throw new Error(`Groq API returned ${res.status}: ${errBody}`);
+      // If model not found or does not exist, invalidate cached choice
+      if (res.status === 404 || errBody.toLowerCase().includes('model') && errBody.toLowerCase().includes('not found')) {
+        cachedGroqModel = null;
+      }
+      const err = new Error(`Groq API returned ${res.status}: ${errBody}`);
+      (err as any).status = res.status;
+      throw err;
     }
 
     const data = await res.json();
@@ -262,13 +365,23 @@ async function callGroq(
 }
 
 /**
- * 3. OpenRouter Provider (Free Models)
+ * 3. OpenRouter Provider
+ * OPENROUTER_MODEL: default "google/gemma-4-31b-it:free"
  */
 async function callOpenRouter(
   req: GenerateRequest,
   apiKey: string,
   isRetry = false
 ): Promise<GenerateResponse> {
+  const configuredModel = process.env.OPENROUTER_MODEL?.trim() || 'google/gemma-4-31b-it:free';
+  const candidateModels = [
+    configuredModel,
+    'google/gemma-4-31b-it:free',
+    'meta-llama/llama-3.3-70b-instruct:free',
+    'qwen/qwen-2.5-72b-instruct:free',
+    'google/gemini-2.0-flash-exp:free',
+  ].filter((m, i, arr) => arr.indexOf(m) === i);
+
   const systemInstruction = buildSystemInstruction() + '\nYou MUST return a JSON object with keys: hooks, script, caption, hashtags, coverText.';
   let prompt = buildUserPrompt(req);
 
@@ -276,15 +389,9 @@ async function callOpenRouter(
     prompt += '\n\nIMPORTANT: Output valid JSON only.';
   }
 
-  const freeModels = [
-    'meta-llama/llama-3.3-70b-instruct:free',
-    'google/gemini-2.0-flash-exp:free',
-    'qwen/qwen-2.5-72b-instruct:free',
-  ];
-
   let lastErr: any = null;
 
-  for (const model of freeModels) {
+  for (const model of candidateModels) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 20000);
 
@@ -292,7 +399,7 @@ async function callOpenRouter(
       const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${apiKey}`,
+          Authorization: `Bearer ${apiKey}`,
           'HTTP-Referer': 'https://scriptkaro.com',
           'X-Title': 'ScriptKaro',
           'Content-Type': 'application/json',
@@ -313,7 +420,15 @@ async function callOpenRouter(
 
       if (!res.ok) {
         const errText = await res.text();
-        throw new Error(`OpenRouter returned ${res.status}: ${errText.slice(0, 150)}`);
+        const err = new Error(`OpenRouter returned ${res.status}: ${errText.slice(0, 200)}`);
+        (err as any).status = res.status;
+
+        // If 404, does not exist, or unavailable for free -> move on to next model
+        if (isNotFoundError(err)) {
+          lastErr = err;
+          continue;
+        }
+        throw err;
       }
 
       const data = await res.json();
@@ -339,11 +454,14 @@ async function callOpenRouter(
     } catch (e: any) {
       clearTimeout(timeoutId);
       lastErr = e;
-      continue;
+      if (isNotFoundError(e)) {
+        continue;
+      }
+      throw e;
     }
   }
 
-  throw lastErr || new Error('All OpenRouter free models failed.');
+  throw lastErr || new Error('All OpenRouter candidate models failed.');
 }
 
 function sanitizeLogMessage(msg: string): string {
@@ -356,6 +474,13 @@ function sanitizeLogMessage(msg: string): string {
     .replace(/sk-or-[a-zA-Z0-9_\-]{20,}/g, '[REDACTED_OPENROUTER_KEY]');
 }
 
+export class AllProvidersRateLimitedError extends Error {
+  constructor(message = 'All AI providers are currently rate limited or quota exhausted.') {
+    super(message);
+    this.name = 'AllProvidersRateLimitedError';
+  }
+}
+
 export interface GenerateScriptResult {
   data: GenerateResponse;
   provider: AIProvider;
@@ -363,18 +488,17 @@ export interface GenerateScriptResult {
 
 /**
  * Master multi-provider fallback runner:
- * Order: Google Gemini -> Groq (Llama 3.3 70B) -> OpenRouter (Free models)
+ * Order: Google Gemini -> Groq -> OpenRouter
  */
 export async function generateScript(
   req: GenerateRequest,
   customGeminiKey?: string
 ): Promise<GenerateScriptResult> {
-  // Use custom key if supplied by user, otherwise fallback to server environment
   const geminiKey = customGeminiKey?.trim() || process.env.GEMINI_API_KEY?.trim();
   const groqKey = process.env.GROQ_API_KEY?.trim();
   const openRouterKey = process.env.OPENROUTER_API_KEY?.trim();
 
-  const providerFailures: string[] = [];
+  const providerFailures: Array<{ provider: string; error: string; isRateLimit: boolean }> = [];
 
   // 1. Try Google Gemini
   if (geminiKey) {
@@ -384,14 +508,15 @@ export async function generateScript(
     } catch (err: any) {
       const rawMsg = err?.message || 'Unknown error';
       const cleanMsg = sanitizeLogMessage(rawMsg);
+      const isRateLimit = isRateLimitError(err);
       console.warn(`[Fallback] Gemini provider failed (${cleanMsg.slice(0, 100)}). Falling back...`);
-      providerFailures.push('Google Gemini');
+      providerFailures.push({ provider: 'Google Gemini', error: cleanMsg, isRateLimit });
     }
   } else {
-    providerFailures.push('Google Gemini (No key configured)');
+    providerFailures.push({ provider: 'Google Gemini', error: 'No key configured', isRateLimit: false });
   }
 
-  // 2. Try Groq (Llama 3.3 70B)
+  // 2. Try Groq
   if (groqKey) {
     try {
       const data = await callGroq(req, groqKey);
@@ -399,14 +524,15 @@ export async function generateScript(
     } catch (err: any) {
       const rawMsg = err?.message || 'Unknown error';
       const cleanMsg = sanitizeLogMessage(rawMsg);
+      const isRateLimit = isRateLimitError(err);
       console.warn(`[Fallback] Groq provider failed (${cleanMsg.slice(0, 100)}). Falling back...`);
-      providerFailures.push('Groq (Llama 3.3)');
+      providerFailures.push({ provider: 'Groq', error: cleanMsg, isRateLimit });
     }
   } else {
-    providerFailures.push('Groq (No key configured)');
+    providerFailures.push({ provider: 'Groq', error: 'No key configured', isRateLimit: false });
   }
 
-  // 3. Try OpenRouter (Free Models)
+  // 3. Try OpenRouter
   if (openRouterKey) {
     try {
       const data = await callOpenRouter(req, openRouterKey);
@@ -414,13 +540,20 @@ export async function generateScript(
     } catch (err: any) {
       const rawMsg = err?.message || 'Unknown error';
       const cleanMsg = sanitizeLogMessage(rawMsg);
+      const isRateLimit = isRateLimitError(err);
       console.warn(`[Fallback] OpenRouter provider failed (${cleanMsg.slice(0, 100)}).`);
-      providerFailures.push('OpenRouter');
+      providerFailures.push({ provider: 'OpenRouter', error: cleanMsg, isRateLimit });
     }
   } else {
-    providerFailures.push('OpenRouter (No key configured)');
+    providerFailures.push({ provider: 'OpenRouter', error: 'No key configured', isRateLimit: false });
+  }
+
+  // Check if all attempted providers failed specifically due to rate limits / quota exhaustion
+  const attemptedProviders = providerFailures.filter((f) => !f.error.includes('No key configured'));
+  if (attemptedProviders.length > 0 && attemptedProviders.every((f) => f.isRateLimit)) {
+    throw new AllProvidersRateLimitedError();
   }
 
   // If all providers failed
-  throw new Error(`All AI providers failed: ${providerFailures.join(', ')}`);
+  throw new Error(`All AI providers failed: ${providerFailures.map((p) => p.provider).join(', ')}`);
 }

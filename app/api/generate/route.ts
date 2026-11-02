@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { checkRateLimit, getClientIp } from '@/lib/rate-limit';
 import { createCacheKey, getCachedResponse, setCachedResponse } from '@/lib/cache';
 import { validateGenerateRequest } from '@/lib/validator';
-import { generateScript } from '@/lib/ai';
+import { generateScript, AllProvidersRateLimitedError } from '@/lib/ai';
 import { GenerateResponse } from '@/lib/types';
 
 export const runtime = 'nodejs';
@@ -82,7 +82,7 @@ export async function POST(req: NextRequest) {
     if (!rateCheck.success) {
       return NextResponse.json(
         {
-          error: 'Bahut log use kar rahe hain, 10 sec mein try karo!',
+          error: 'Bahut log use kar rahe hain, thodi der baad try karo',
           details: `Aapne limit exceed kar di hai. Please ${rateCheck.resetInSeconds} seconds wait karke dubara generate karo.`,
           code: 'RATE_LIMITED',
         },
@@ -198,6 +198,8 @@ export async function POST(req: NextRequest) {
     }
 
     const isRateLimit =
+      err instanceof AllProvidersRateLimitedError ||
+      rawError.includes('AllProvidersRateLimitedError') ||
       rawError.includes('429') ||
       rawError.toLowerCase().includes('quota') ||
       rawError.toLowerCase().includes('resource has been exhausted') ||
@@ -206,8 +208,8 @@ export async function POST(req: NextRequest) {
     if (isRateLimit) {
       return NextResponse.json(
         {
-          error: 'Bahut log use kar rahe hain, 10 sec mein try karo!',
-          details: 'All AI models are currently experiencing peak traffic. Please try again shortly.',
+          error: 'Bahut log use kar rahe hain, thodi der baad try karo',
+          details: 'All AI models are currently experiencing peak traffic or quota limits. Please try again shortly.',
           code: 'RATE_LIMITED',
         },
         { status: 429, headers: { 'Retry-After': '10' } }
