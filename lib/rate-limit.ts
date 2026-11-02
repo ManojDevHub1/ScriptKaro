@@ -1,11 +1,14 @@
+import { Redis } from '@upstash/redis';
+import { Ratelimit } from '@upstash/ratelimit';
+
 interface RateLimitRecord {
   timestamps: number[];
 }
 
-// In-memory token storage (per IP)
+// In-memory token storage (per IP fallback)
 const ipStore = new Map<string, RateLimitRecord>();
 
-// Clean up stale IPs every 5 minutes to prevent memory leaks
+// Clean up stale IPs every 5 minutes to prevent memory leaks in dev/fallback
 if (typeof setInterval !== 'undefined') {
   setInterval(() => {
     const now = Date.now();
@@ -28,13 +31,37 @@ export interface RateLimitResult {
   resetInSeconds: number;
 }
 
+let upstashRatelimit: Ratelimit | null = null;
+
+function getUpstashRatelimit(): Ratelimit | null {
+  if (upstashRatelimit) return upstashRatelimit;
+
+  const url = process.env.UPSTASH_REDIS_REST_URL?.trim();
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN?.trim();
+
+  if (url && token) {
+    try {
+      const redis = new Redis({ url, token });
+      upstashRatelimit = new Ratelimit({
+        redis,
+        limiter: Ratelimit.slidingWindow(10, '60 s'),
+        prefix: 'scriptkaro:ratelimit',
+        analytics: false,
+      });
+      return upstashRatelimit;
+    } catch (e) {
+      console.warn('[RateLimit] Failed to initialize Upstash Ratelimit, falling back to memory:', e);
+      return null;
+    }
+  }
+
+  return null;
+}
+
 /**
- * Sliding Window Rate Limiter
- * @param identifier - Client IP or user identifier
- * @param limit - Maximum requests allowed in the window (default: 10)
- * @param windowMs - Time window in milliseconds (default: 60,000ms / 1 min)
+ * In-memory fallback rate limiter
  */
-export function checkRateLimit(
+function checkRateLimitMemory(
   identifier: string,
   limit: number = 10,
   windowMs: number = 60 * 1000
@@ -42,7 +69,6 @@ export function checkRateLimit(
   const now = Date.now();
   const record = ipStore.get(identifier) || { timestamps: [] };
 
-  // Remove timestamps outside the sliding window
   const recentTimestamps = record.timestamps.filter((ts) => now - ts < windowMs);
 
   if (recentTimestamps.length >= limit) {
@@ -68,6 +94,38 @@ export function checkRateLimit(
     remaining: limit - recentTimestamps.length,
     resetInSeconds,
   };
+}
+
+/**
+ * Master rate limit checker:
+ * Uses Upstash Redis (@upstash/ratelimit) if env vars are present,
+ * gracefully falling back to in-memory sliding window limiter otherwise.
+ */
+export async function checkRateLimit(
+  identifier: string,
+  limit: number = 10,
+  windowMs: number = 60 * 1000
+): Promise<RateLimitResult> {
+  const ratelimiter = getUpstashRatelimit();
+
+  if (ratelimiter) {
+    try {
+      const res = await ratelimiter.limit(identifier);
+      const resetInSeconds = Math.max(1, Math.ceil((res.reset - Date.now()) / 1000));
+
+      return {
+        success: res.success,
+        limit: res.limit,
+        remaining: res.remaining,
+        resetInSeconds,
+      };
+    } catch (err) {
+      console.warn('[RateLimit] Upstash error, using in-memory fallback:', err);
+    }
+  }
+
+  // Fallback to in-memory
+  return checkRateLimitMemory(identifier, limit, windowMs);
 }
 
 /**

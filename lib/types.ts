@@ -5,6 +5,7 @@ export type AIProvider = 'gemini' | 'groq' | 'openrouter';
 
 export interface GenerateRequest {
   topic: string;
+  keyFacts?: string;
   language: LanguageOption;
   length: LengthOption;
   tone: ToneOption;

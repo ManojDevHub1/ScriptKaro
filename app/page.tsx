@@ -38,6 +38,7 @@ const CUSTOM_KEY_STORAGE = 'scriptkaro_custom_gemini_key';
 export default function HomePage() {
   const [formData, setFormData] = useState<GenerateRequest>({
     topic: '',
+    keyFacts: '',
     language: 'hinglish',
     length: 60,
     tone: 'hype',
@@ -620,6 +621,13 @@ export default function HomePage() {
                   </p>
                 </div>
               </ResultCard>
+
+              {/* Verified Facts & AI Disclaimer Note */}
+              <div className="pt-2 pb-1 text-center">
+                <p className="text-xs text-gray-500 font-medium tracking-wide">
+                  AI can make mistakes. Verify facts before posting.
+                </p>
+              </div>
             </motion.div>
           )}
         </main>

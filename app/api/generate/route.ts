@@ -3,6 +3,7 @@ import { checkRateLimit, getClientIp } from '@/lib/rate-limit';
 import { createCacheKey, getCachedResponse, setCachedResponse } from '@/lib/cache';
 import { validateGenerateRequest } from '@/lib/validator';
 import { generateScript } from '@/lib/ai';
+import { GenerateResponse } from '@/lib/types';
 
 export const runtime = 'nodejs';
 
@@ -46,6 +47,17 @@ function isSameOriginRequest(req: NextRequest): boolean {
   return true;
 }
 
+/**
+ * Filter out sensitive or dev-only fields in production
+ */
+function formatResponsePayload(data: GenerateResponse): Partial<GenerateResponse> {
+  const payload: Partial<GenerateResponse> = { ...data };
+  if (process.env.NODE_ENV === 'production') {
+    delete payload.provider;
+  }
+  return payload;
+}
+
 export async function POST(req: NextRequest) {
   // 1. Method and Origin Enforcement
   if (!isSameOriginRequest(req)) {
@@ -56,9 +68,9 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    // 2. Per-IP Rate Limiting (10 requests per minute)
+    // 2. Per-IP Rate Limiting (Upstash Redis with in-memory fallback)
     const clientIp = getClientIp(req);
-    const rateCheck = checkRateLimit(clientIp, 10, 60 * 1000);
+    const rateCheck = await checkRateLimit(clientIp, 10, 60 * 1000);
 
     const rateHeaders = {
       'X-RateLimit-Limit': String(rateCheck.limit),
@@ -84,7 +96,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 3. Strict Input Validation (Type, Length, Whitelist)
+    // 3. Strict Input Validation (Type, Length, Whitelist, Safety)
     let body: any;
     try {
       body = await req.json();
@@ -97,8 +109,14 @@ export async function POST(req: NextRequest) {
 
     const validation = validateGenerateRequest(body);
     if (!validation.valid || !validation.sanitized) {
+      const isSafety = validation.code === 'SAFETY_BLOCKED';
       return NextResponse.json(
-        { error: validation.error || 'Invalid request inputs.', code: 'INVALID_INPUT' },
+        {
+          error: isSafety
+            ? 'Is topic pe script nahi ban sakti, kuch aur try karo'
+            : (validation.error || 'Invalid request inputs.'),
+          code: validation.code || 'INVALID_INPUT',
+        },
         { status: 400, headers: rateHeaders }
       );
     }
@@ -111,22 +129,26 @@ export async function POST(req: NextRequest) {
       (typeof body.customApiKey === 'string' ? body.customApiKey : undefined);
     const customGeminiKey = rawCustomKey ? rawCustomKey.trim() : undefined;
 
-    // 4. In-Memory Request Cache Check (10 mins TTL)
+    // 4. Redis Cache Check (with in-memory fallback)
     const cacheKey = createCacheKey(
       sanitizedReq.topic,
       sanitizedReq.language,
       sanitizedReq.length,
-      sanitizedReq.tone
+      sanitizedReq.tone,
+      sanitizedReq.keyFacts
     );
 
-    const cachedData = getCachedResponse(cacheKey);
+    const cachedData = await getCachedResponse(cacheKey);
     if (cachedData) {
-      return NextResponse.json(cachedData, {
+      const cachedPayload = formatResponsePayload(cachedData);
+      return NextResponse.json(cachedPayload, {
         status: 200,
         headers: {
           ...rateHeaders,
           'X-Cache': 'HIT',
-          'X-Provider': cachedData.provider || 'cache',
+          ...(process.env.NODE_ENV !== 'production' && cachedData.provider
+            ? { 'X-Provider': cachedData.provider }
+            : {}),
         },
       });
     }
@@ -134,15 +156,19 @@ export async function POST(req: NextRequest) {
     // 5. Generate with Multi-Provider Fallback: Gemini -> Groq -> OpenRouter
     const result = await generateScript(sanitizedReq, customGeminiKey);
 
-    // 6. Save to In-Memory Cache (10 minutes)
-    setCachedResponse(cacheKey, result.data);
+    // 6. Save to Redis Cache (with in-memory fallback)
+    await setCachedResponse(cacheKey, result.data);
 
-    return NextResponse.json(result.data, {
+    const responsePayload = formatResponsePayload(result.data);
+
+    return NextResponse.json(responsePayload, {
       status: 200,
       headers: {
         ...rateHeaders,
         'X-Cache': 'MISS',
-        'X-Provider': result.provider,
+        ...(process.env.NODE_ENV !== 'production'
+          ? { 'X-Provider': result.provider }
+          : {}),
       },
     });
   } catch (err: any) {
@@ -150,6 +176,26 @@ export async function POST(req: NextRequest) {
     
     // Server logs internal info with any key or secret redacted
     console.error('[API /api/generate Error]:', rawError.replace(/(key|token)=[^\s&]+/gi, '$1=[REDACTED]'));
+
+    // Safety or Prompt Injection rejection from AI providers
+    const isSafetyBlocked =
+      rawError.toLowerCase().includes('safety') ||
+      rawError.toLowerCase().includes('harm_category') ||
+      rawError.toLowerCase().includes('blocked') ||
+      rawError.toLowerCase().includes('content filter') ||
+      rawError.toLowerCase().includes('violat') ||
+      rawError.toLowerCase().includes('prohibited');
+
+    if (isSafetyBlocked) {
+      return NextResponse.json(
+        {
+          error: 'Is topic pe script nahi ban sakti, kuch aur try karo',
+          details: 'Topic was filtered by safety policies.',
+          code: 'SAFETY_BLOCKED',
+        },
+        { status: 400 }
+      );
+    }
 
     const isRateLimit =
       rawError.includes('429') ||

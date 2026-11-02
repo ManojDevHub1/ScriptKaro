@@ -18,11 +18,12 @@ Enter any topic, select your preferred language (*Roman Hinglish, Hindi, or Engl
 ## ✨ Features
 
 - **🎯 3 Scroll-Stopping Hooks (0–3s)**: High Curiosity/FOMO, Pain Point, and Mindblown hooks scientifically engineered to beat the scroll.
+- **📌 Grounded Key Facts**: Optional facts box (features, pricing, links) so the AI never invents or hallucinates fake claims.
 - **⏱️ Scene-Wise Timestamps & Camera Cues**: Paced scene breakdowns with dialogue and exact editing/visual cues (B-roll, zooms, onscreen text popups).
 - **🗣️ Natural Roman Hinglish & Creator Slang**: Real conversational cadence (*"Bhai yeh secret trick dekh ke dimaag hil jayega"*) rather than robotic translation.
 - **🔄 Multi-Provider AI Fallback**: Resilient cascading provider pipeline: **Google Gemini Flash ➔ Groq (Llama 3.3 70B) ➔ OpenRouter Free Models**.
 - **📋 1-Click Copy & Confetti**: Copy individual hooks, scenes, captions, hashtags, or the entire script package with one click.
-- **⚡ In-Memory Request Cache**: Identical queries are cached for 10 minutes, saving API quota and providing sub-100ms instant loads.
+- **⚡ Upstash Redis & Distributed Cache**: Global sub-100ms caching and rate limiting via Upstash Redis (with seamless in-memory fallback).
 - **🛡️ Rate-Limited & Protected**: Built-in IP-based rate limiting (10 req/min) with polite retry notices.
 - **💾 Local History**: Last 10 scripts saved automatically in your browser's `localStorage` (no account or database needed).
 - **📱 PWA & Mobile-First Design**: Installable on iOS and Android devices, with touch targets sized at 44px+ and fluid responsive typography.

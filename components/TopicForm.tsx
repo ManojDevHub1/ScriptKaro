@@ -149,6 +149,32 @@ export default function TopicForm({ formData, onChange, onSubmit, loading }: Top
         </div>
       </div>
 
+      {/* Optional Key Facts Box */}
+      <div className="space-y-1.5">
+        <div className="flex items-center justify-between gap-2">
+          <label htmlFor="key-facts-input" className="block text-xs sm:text-sm font-medium text-gray-300">
+            Key Facts <span className="text-gray-500 font-normal">(Optional)</span>
+          </label>
+          <span className="text-[11px] text-gray-500 font-mono select-none">
+            {(formData.keyFacts || '').length}/500
+          </span>
+        </div>
+
+        <div className="relative">
+          <textarea
+            id="key-facts-input"
+            rows={2}
+            value={formData.keyFacts || ''}
+            onChange={(e) => setField('keyFacts', e.target.value)}
+            placeholder="Real facts about your topic, e.g. what the tool does, price, link"
+            className="w-full glass-input rounded-xl px-4 py-2.5 sm:py-3 text-sm text-white placeholder-gray-500 resize-none focus:ring-0 leading-relaxed min-h-[68px] break-words"
+            disabled={loading}
+            maxLength={500}
+            aria-label="Key facts about your topic"
+          />
+        </div>
+      </div>
+
       {/* Options Grid: Responsive 1 col on mobile, 3 cols on tablet & desktop */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-1">
         {/* Language Option */}
