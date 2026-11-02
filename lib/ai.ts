@@ -226,147 +226,142 @@ async function callGemini(
 
 /**
  * 2. Groq Provider
- * Dynamic model discovery with preference list and caching
+ * Primary model: "openai/gpt-oss-120b"
+ * Fallbacks: "qwen/qwen3.8-27b", then "openai/gpt-oss-20b"
+ * Only tries the next fallback on a 404 or 429 error.
+ * JSON response mode kept ON.
  */
-let cachedGroqModel: string | null = null;
-
-const GROQ_PREFERENCE_LIST = [
-  'llama-3.3-70b-versatile',
-  'meta-llama/llama-4-maverick-17b-128e-instruct',
-  'meta-llama/llama-4-scout-17b-16e-instruct',
-  'llama-3.1-8b-instant',
-];
-
-async function resolveGroqModel(apiKey: string): Promise<string> {
-  if (cachedGroqModel) {
-    return cachedGroqModel;
-  }
-
-  const envModel = process.env.GROQ_MODEL?.trim();
-
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
-
-    const res = await fetch('https://api.groq.com/openai/v1/models', {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeout);
-
-    if (res.ok) {
-      const data = await res.json();
-      const availableModels = new Set<string>(
-        Array.isArray(data?.data) ? data.data.map((m: any) => String(m?.id || '')) : []
-      );
-
-      // 1. Pick GROQ_MODEL if defined and available
-      if (envModel && availableModels.has(envModel)) {
-        cachedGroqModel = envModel;
-        return cachedGroqModel;
-      }
-
-      // 2. Pick first available from preference list
-      for (const pref of GROQ_PREFERENCE_LIST) {
-        if (availableModels.has(pref)) {
-          cachedGroqModel = pref;
-          return cachedGroqModel;
-        }
-      }
-    }
-  } catch (err) {
-    console.warn('[Groq] Failed to discover models list, using preference default:', err);
-  }
-
-  cachedGroqModel = envModel || GROQ_PREFERENCE_LIST[0];
-  return cachedGroqModel;
-}
-
 async function callGroq(
   req: GenerateRequest,
   apiKey: string,
   isRetry = false
 ): Promise<GenerateResponse> {
-  const model = await resolveGroqModel(apiKey);
-  const systemInstruction = buildSystemInstruction() + '\nYou MUST return a JSON object with keys: hooks, script, caption, hashtags, coverText.';
+  const primaryModel = process.env.GROQ_MODEL?.trim() || 'openai/gpt-oss-120b';
+  const candidateModels = [
+    primaryModel,
+    'qwen/qwen3.8-27b',
+    'openai/gpt-oss-20b',
+  ].filter((m, i, arr) => arr.indexOf(m) === i);
+
+  const systemInstruction =
+    buildSystemInstruction() +
+    '\nYou MUST return a JSON object with keys: hooks, script, caption, hashtags, coverText.';
   let prompt = buildUserPrompt(req);
 
   if (isRetry) {
     prompt += '\n\nIMPORTANT: Previous response was not valid JSON. Return ONLY a single raw JSON object.';
   }
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 20000);
+  let lastErr: any = null;
 
-  try {
-    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: 'system', content: systemInstruction },
-          { role: 'user', content: prompt },
-        ],
-        response_format: { type: 'json_object' },
-        temperature: 0.7,
-      }),
-      signal: controller.signal,
-    });
+  for (let i = 0; i < candidateModels.length; i++) {
+    const model = candidateModels[i];
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 20000);
 
-    clearTimeout(timeoutId);
-
-    if (!res.ok) {
-      const errBody = await res.text();
-      // If model not found or does not exist, invalidate cached choice
-      if (res.status === 404 || errBody.toLowerCase().includes('model') && errBody.toLowerCase().includes('not found')) {
-        cachedGroqModel = null;
-      }
-      const err = new Error(`Groq API returned ${res.status}: ${errBody}`);
-      (err as any).status = res.status;
-      throw err;
-    }
-
-    const data = await res.json();
-    const rawText = data?.choices?.[0]?.message?.content;
-
-    if (!rawText) {
-      throw new Error('Groq returned empty content.');
-    }
-
-    const cleaned = sanitizeJsonText(rawText);
-    let parsed: any;
     try {
-      parsed = JSON.parse(cleaned);
-    } catch {
-      if (!isRetry) {
+      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'system', content: systemInstruction },
+            { role: 'user', content: prompt },
+          ],
+          response_format: { type: 'json_object' },
+          temperature: 0.7,
+        }),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!res.ok) {
+        const errBody = await res.text();
+        const err = new Error(`Groq API (${model}) returned ${res.status}: ${errBody}`);
+        (err as any).status = res.status;
+        lastErr = err;
+
+        // ONLY try the next fallback on a 404 or 429
+        const is404Or429 =
+          res.status === 404 ||
+          res.status === 429 ||
+          errBody.includes('404') ||
+          errBody.includes('429') ||
+          errBody.toLowerCase().includes('model_not_found') ||
+          errBody.toLowerCase().includes('does not exist') ||
+          errBody.toLowerCase().includes('rate limit') ||
+          errBody.toLowerCase().includes('quota') ||
+          errBody.toLowerCase().includes('resource_exhausted');
+
+        if (is404Or429 && i < candidateModels.length - 1) {
+          console.warn(
+            `[Groq] Model "${model}" failed with status ${res.status}. Falling back to next model "${candidateModels[i + 1]}"...`
+          );
+          continue;
+        }
+
+        // If not a 404/429 or is the last model, stop and throw
+        throw err;
+      }
+
+      const data = await res.json();
+      const rawText = data?.choices?.[0]?.message?.content;
+
+      if (!rawText) {
+        throw new Error(`Groq model ${model} returned empty content.`);
+      }
+
+      const cleaned = sanitizeJsonText(rawText);
+      let parsed: any;
+      try {
+        parsed = JSON.parse(cleaned);
+      } catch {
+        if (!isRetry) {
+          return callGroq(req, apiKey, true);
+        }
+        throw new Error('Groq returned malformed JSON.');
+      }
+
+      if (!validateScriptJson(parsed) && !isRetry) {
         return callGroq(req, apiKey, true);
       }
-      throw new Error('Groq returned malformed JSON.');
-    }
 
-    if (!validateScriptJson(parsed) && !isRetry) {
-      return callGroq(req, apiKey, true);
-    }
+      return normalizeResult(parsed, req.topic, 'groq');
+    } catch (e: any) {
+      clearTimeout(timeoutId);
+      lastErr = e;
 
-    return normalizeResult(parsed, req.topic, 'groq');
-  } catch (e: any) {
-    clearTimeout(timeoutId);
-    throw e;
+      const is404Or429 =
+        e?.status === 404 ||
+        e?.status === 429 ||
+        String(e?.message || '').includes('404') ||
+        String(e?.message || '').includes('429') ||
+        isNotFoundError(e) ||
+        isRateLimitError(e);
+
+      if (is404Or429 && i < candidateModels.length - 1) {
+        console.warn(
+          `[Groq] Model "${model}" encountered 404/429. Falling back to "${candidateModels[i + 1]}"...`
+        );
+        continue;
+      }
+
+      throw e;
+    }
   }
+
+  throw lastErr || new Error('All Groq candidate models failed.');
 }
 
 /**
  * 3. OpenRouter Provider
- * OPENROUTER_MODEL: default "google/gemma-4-31b-it:free"
+ * Primary model: "google/gemma-4-31b-it:free"
+ * JSON response mode kept ON.
  */
 async function callOpenRouter(
   req: GenerateRequest,
@@ -382,7 +377,9 @@ async function callOpenRouter(
     'google/gemini-2.0-flash-exp:free',
   ].filter((m, i, arr) => arr.indexOf(m) === i);
 
-  const systemInstruction = buildSystemInstruction() + '\nYou MUST return a JSON object with keys: hooks, script, caption, hashtags, coverText.';
+  const systemInstruction =
+    buildSystemInstruction() +
+    '\nYou MUST return a JSON object with keys: hooks, script, caption, hashtags, coverText.';
   let prompt = buildUserPrompt(req);
 
   if (isRetry) {
